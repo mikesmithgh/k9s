@@ -1,7 +1,11 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package xray
 
 import (
 	"fmt"
+	"log/slog"
 	"reflect"
 	"sort"
 	"strings"
@@ -9,7 +13,6 @@ import (
 	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/dao"
 	"github.com/fvbommel/sortorder"
-	"github.com/rs/zerolog/log"
 )
 
 const (
@@ -349,10 +352,10 @@ func (t *TreeNode) Dump() {
 
 func dump(n *TreeNode, level int) {
 	if n == nil {
-		log.Debug().Msgf("NO DATA!!")
+		slog.Debug("NO DATA!!")
 		return
 	}
-	log.Debug().Msgf("%s%s::%s\n", strings.Repeat("  ", level), n.GVR, n.ID)
+	slog.Debug(fmt.Sprintf("%s%s::%s\n", strings.Repeat("  ", level), n.GVR, n.ID))
 	for _, c := range n.Children {
 		dump(c, level+1)
 	}
@@ -486,7 +489,7 @@ func toEmoji(gvr string) string {
 		return "👨🏻‍"
 	case "networking.k8s.io/v1/networkpolicies":
 		return "📕"
-	case "policy/v1beta1/poddisruptionbudgets":
+	case "policy/v1/poddisruptionbudgets":
 		return "🏷 "
 	case "policy/v1beta1/podsecuritypolicies":
 		return "👮‍♂️"

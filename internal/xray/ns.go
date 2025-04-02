@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package xray
 
 import (
@@ -17,7 +20,7 @@ type Namespace struct{}
 func (n *Namespace) Render(ctx context.Context, ns string, o interface{}) error {
 	raw, ok := o.(*unstructured.Unstructured)
 	if !ok {
-		return fmt.Errorf("Expected NamespaceWithMetrics, but got %T", o)
+		return fmt.Errorf("expected NamespaceWithMetrics, but got %T", o)
 	}
 
 	var nss v1.Namespace
@@ -29,7 +32,7 @@ func (n *Namespace) Render(ctx context.Context, ns string, o interface{}) error 
 	root := NewTreeNode("v1/namespaces", client.FQN(client.ClusterScope, nss.Name))
 	parent, ok := ctx.Value(KeyParent).(*TreeNode)
 	if !ok {
-		return fmt.Errorf("Expecting a TreeNode but got %T", ctx.Value(KeyParent))
+		return fmt.Errorf("expecting a TreeNode but got %T", ctx.Value(KeyParent))
 	}
 	parent.Add(root)
 

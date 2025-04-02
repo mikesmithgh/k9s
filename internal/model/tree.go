@@ -1,8 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package model
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -12,9 +16,9 @@ import (
 	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/dao"
 	"github.com/derailed/k9s/internal/render"
+	"github.com/derailed/k9s/internal/slogs"
 	"github.com/derailed/k9s/internal/xray"
-	"github.com/rs/zerolog/log"
-	metav1beta1 "k8s.io/apimachinery/pkg/apis/meta/v1beta1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 )
 
@@ -159,7 +163,7 @@ func (t *Tree) ToYAML(ctx context.Context, gvr, path string) (string, error) {
 }
 
 func (t *Tree) updater(ctx context.Context) {
-	defer log.Debug().Msgf("Tree-model canceled -- %q", t.gvr)
+	defer slog.Debug("Tree-model canceled", slogs.GVR, t.gvr)
 
 	rate := initTreeRefreshRate
 	for {
@@ -176,13 +180,13 @@ func (t *Tree) updater(ctx context.Context) {
 
 func (t *Tree) refresh(ctx context.Context) {
 	if !atomic.CompareAndSwapInt32(&t.inUpdate, 0, 1) {
-		log.Debug().Msgf("Dropping update...")
+		slog.Debug("Dropping update...")
 		return
 	}
 	defer atomic.StoreInt32(&t.inUpdate, 0)
 
 	if err := t.reconcile(ctx); err != nil {
-		log.Error().Err(err).Msg("Reconcile failed")
+		slog.Error("Reconcile failed", slogs.Error, err)
 		t.fireTreeLoadFailed(err)
 		return
 	}
@@ -210,7 +214,7 @@ func (t *Tree) reconcile(ctx context.Context) error {
 	root := xray.NewTreeNode(res, res)
 	ctx = context.WithValue(ctx, xray.KeyParent, root)
 	if _, ok := meta.TreeRenderer.(*xray.Generic); ok {
-		table, ok := oo[0].(*metav1beta1.Table)
+		table, ok := oo[0].(*metav1.Table)
 		if !ok {
 			return fmt.Errorf("expecting a Table but got %T", oo[0])
 		}
@@ -223,7 +227,7 @@ func (t *Tree) reconcile(ctx context.Context) error {
 
 	root.Sort()
 	if t.query != "" {
-		t.root = root.Filter(t.query, rxFilter)
+		t.root = root.Filter(t.query, rxMatch)
 	}
 	if t.root == nil || t.root.Diff(root) {
 		t.root = root
@@ -238,7 +242,7 @@ func (t *Tree) resourceMeta() ResourceMeta {
 	if !ok {
 		meta = ResourceMeta{
 			DAO:      &dao.Table{},
-			Renderer: &render.Generic{},
+			Renderer: &render.Table{},
 		}
 	}
 	if meta.DAO == nil {
@@ -274,7 +278,7 @@ func (t *Tree) getMeta(ctx context.Context, gvr string) (ResourceMeta, error) {
 // ----------------------------------------------------------------------------
 // Helpers...
 
-func rxFilter(q, path string) bool {
+func rxMatch(q, path string) bool {
 	rx := regexp.MustCompile(`(?i)` + q)
 
 	tokens := strings.Split(path, "::")
@@ -299,7 +303,7 @@ func treeHydrate(ctx context.Context, ns string, oo []runtime.Object, re TreeRen
 	return nil
 }
 
-func genericTreeHydrate(ctx context.Context, ns string, table *metav1beta1.Table, re TreeRenderer) error {
+func genericTreeHydrate(ctx context.Context, ns string, table *metav1.Table, re TreeRenderer) error {
 	tre, ok := re.(*xray.Generic)
 	if !ok {
 		return fmt.Errorf("expecting xray.Generic renderer but got %T", re)

@@ -1,15 +1,18 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package model_test
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/derailed/k9s/internal/model"
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 )
 
 func init() {
-	zerolog.SetGlobalLevel(zerolog.FatalLevel)
+	slog.SetDefault(slog.New(slog.DiscardHandler))
 }
 
 func TestClusterMetaDelta(t *testing.T) {

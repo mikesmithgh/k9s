@@ -1,8 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package model
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -11,7 +15,7 @@ import (
 	"github.com/derailed/k9s/internal/color"
 	"github.com/derailed/k9s/internal/config"
 	"github.com/derailed/k9s/internal/dao"
-	"github.com/rs/zerolog/log"
+	"github.com/derailed/k9s/internal/slogs"
 )
 
 // LogsListener represents a log model listener.
@@ -28,7 +32,7 @@ type LogsListener interface {
 	// LogStop indicates logging was canceled.
 	LogStop()
 
-	// LogResume indicates loggings has resumed.
+	// LogResume indicates logging has resumed.
 	LogResume()
 
 	// LogCanceled indicates no more logs will come.
@@ -105,7 +109,7 @@ func (l *Log) SetSinceSeconds(ctx context.Context, i int64) {
 }
 
 // Configure sets logger configuration.
-func (l *Log) Configure(opts *config.Logger) {
+func (l *Log) Configure(opts config.Logger) {
 	l.logOptions.Lines = int64(opts.TailCount)
 	l.logOptions.SinceSeconds = opts.SinceSeconds
 }
@@ -161,7 +165,7 @@ func (l *Log) Restart(ctx context.Context) {
 // Start starts logging.
 func (l *Log) Start(ctx context.Context) {
 	if err := l.load(ctx); err != nil {
-		log.Error().Err(err).Msgf("Tail logs failed!")
+		slog.Error("Tail logs failed!", slogs.Error, err)
 		l.fireLogError(err)
 	}
 }
@@ -216,7 +220,6 @@ func (l *Log) cancel() {
 	defer l.mx.Unlock()
 	if l.cancelFn != nil {
 		l.cancelFn()
-		log.Debug().Msgf("!!! LOG-MODEL CANCELED !!!")
 		l.cancelFn = nil
 	}
 }
@@ -228,7 +231,7 @@ func (l *Log) load(ctx context.Context) error {
 	}
 	loggable, ok := accessor.(dao.Loggable)
 	if !ok {
-		return fmt.Errorf("Resource %s is not Loggable", l.gvr)
+		return fmt.Errorf("resource %s is not Loggable", l.gvr)
 	}
 
 	l.cancel()
@@ -237,7 +240,7 @@ func (l *Log) load(ctx context.Context) error {
 
 	cc, err := loggable.TailLogs(ctx, l.logOptions)
 	if err != nil {
-		log.Error().Err(err).Msgf("Tail logs failed")
+		slog.Error("Tail logs failed", slogs.Error, err)
 		l.cancel()
 		l.fireLogError(err)
 	}
@@ -285,8 +288,6 @@ func (l *Log) ToggleAllContainers(ctx context.Context) {
 }
 
 func (l *Log) updateLogs(ctx context.Context, c dao.LogChan) {
-	defer log.Debug().Msgf("<<< LOG-MODEL UPDATER DONE %s!!!!", l.logOptions.Info())
-	log.Debug().Msgf(">>> START LOG-MODEL UPDATER %s", l.logOptions.Info())
 	for {
 		select {
 		case item, ok := <-c:

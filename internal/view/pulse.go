@@ -1,14 +1,12 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package view
 
 import (
 	"context"
 	"fmt"
 	"image"
-
-	"github.com/derailed/tcell/v2"
-	"github.com/derailed/tview"
-	"golang.org/x/text/cases"
-	"golang.org/x/text/language"
 
 	"github.com/derailed/k9s/internal"
 	"github.com/derailed/k9s/internal/client"
@@ -18,6 +16,11 @@ import (
 	"github.com/derailed/k9s/internal/render"
 	"github.com/derailed/k9s/internal/tchart"
 	"github.com/derailed/k9s/internal/ui"
+	"github.com/derailed/k9s/internal/view/cmd"
+	"github.com/derailed/tcell/v2"
+	"github.com/derailed/tview"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 // Graphable represents a graphic component.
@@ -61,7 +64,7 @@ type Pulse struct {
 	gvr      client.GVR
 	model    *model.Pulse
 	cancelFn context.CancelFunc
-	actions  ui.KeyActions
+	actions  *ui.KeyActions
 	charts   []Graphable
 }
 
@@ -70,9 +73,13 @@ func NewPulse(gvr client.GVR) ResourceViewer {
 	return &Pulse{
 		Grid:    tview.NewGrid(),
 		model:   model.NewPulse(gvr.String()),
-		actions: make(ui.KeyActions),
+		actions: ui.NewKeyActions(),
 	}
 }
+
+func (p *Pulse) SetCommand(*cmd.Interpreter)      {}
+func (p *Pulse) SetFilter(string)                 {}
+func (p *Pulse) SetLabelFilter(map[string]string) {}
 
 // Init initializes the view.
 func (p *Pulse) Init(ctx context.Context) error {
@@ -201,15 +208,15 @@ func (p *Pulse) PulseFailed(err error) {
 }
 
 func (p *Pulse) bindKeys() {
-	p.actions.Add(ui.KeyActions{
+	p.actions.Merge(ui.NewKeyActionsFromMap(ui.KeyMap{
 		tcell.KeyEnter:   ui.NewKeyAction("Goto", p.enterCmd, true),
 		tcell.KeyTab:     ui.NewKeyAction("Next", p.nextFocusCmd(1), true),
 		tcell.KeyBacktab: ui.NewKeyAction("Prev", p.nextFocusCmd(-1), true),
-	})
+	}))
 
 	for i, v := range p.charts {
 		t := cases.Title(language.Und, cases.NoLower).String(client.NewGVR(v.ID()).R())
-		p.actions[ui.NumKeys[i]] = ui.NewKeyAction(t, p.sparkFocusCmd(i), true)
+		p.actions.Add(ui.NumKeys[i], ui.NewKeyAction(t, p.sparkFocusCmd(i), true))
 	}
 }
 
@@ -218,7 +225,7 @@ func (p *Pulse) keyboard(evt *tcell.EventKey) *tcell.EventKey {
 	if key == tcell.KeyRune {
 		key = tcell.Key(evt.Rune())
 	}
-	if a, ok := p.actions[key]; ok {
+	if a, ok := p.actions.Get(key); ok {
 		return a.Action(evt)
 	}
 
@@ -283,7 +290,7 @@ func (p *Pulse) GetTable() *Table {
 }
 
 // Actions returns active menu bindings.
-func (p *Pulse) Actions() ui.KeyActions {
+func (p *Pulse) Actions() *ui.KeyActions {
 	return p.actions
 }
 
@@ -314,7 +321,7 @@ func (p *Pulse) enterCmd(evt *tcell.EventKey) *tcell.EventKey {
 	if res == "cpu" || res == "mem" {
 		res = "pod"
 	}
-	p.App().gotoResource(res+" all", "", false)
+	p.App().gotoResource(res+" all", "", false, true)
 
 	return nil
 }

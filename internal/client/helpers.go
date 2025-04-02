@@ -1,12 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package client
 
 import (
+	"log/slog"
+	"os"
 	"os/user"
 	"path"
 	"regexp"
 	"strings"
 
-	"github.com/rs/zerolog/log"
+	"github.com/derailed/k9s/internal/slogs"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -14,13 +19,13 @@ var toFileName = regexp.MustCompile(`[^(\w/\.)]`)
 
 // IsClusterWide returns true if ns designates cluster scope, false otherwise.
 func IsClusterWide(ns string) bool {
-	return ns == NamespaceAll || ns == AllNamespaces || ns == ClusterScope
+	return ns == NamespaceAll || ns == BlankNamespace || ns == ClusterScope
 }
 
 // CleanseNamespace ensures all ns maps to blank.
 func CleanseNamespace(ns string) string {
 	if IsAllNamespace(ns) {
-		return AllNamespaces
+		return BlankNamespace
 	}
 
 	return ns
@@ -33,12 +38,12 @@ func IsAllNamespace(ns string) bool {
 
 // IsAllNamespaces returns true if all namespaces, false otherwise.
 func IsAllNamespaces(ns string) bool {
-	return ns == NamespaceAll || ns == AllNamespaces
+	return ns == NamespaceAll || ns == BlankNamespace
 }
 
 // IsNamespaced returns true if a specific ns is given.
 func IsNamespaced(ns string) bool {
-	return !IsAllNamespaces(ns)
+	return !IsAllNamespaces(ns) && !IsClusterScoped(ns)
 }
 
 // IsClusterScoped returns true if resource is not namespaced.
@@ -78,7 +83,8 @@ func MetaFQN(m metav1.ObjectMeta) string {
 func mustHomeDir() string {
 	usr, err := user.Current()
 	if err != nil {
-		log.Fatal().Err(err).Msg("Die getting user home directory")
+		slog.Error("Die getting user home directory", slogs.Error, err)
+		os.Exit(1)
 	}
 	return usr.HomeDir
 }

@@ -1,11 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package model
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"time"
 
-	"github.com/rs/zerolog/log"
+	"github.com/derailed/k9s/internal/slogs"
 )
 
 const (
@@ -20,7 +24,7 @@ const (
 	FlashErr
 )
 
-// LevelMessage tracks an message and severity.
+// LevelMessage tracks a message and severity.
 type LevelMessage struct {
 	Level FlashLevel
 	Text  string
@@ -83,7 +87,7 @@ func (f *Flash) Infof(fmat string, args ...interface{}) {
 
 // Warn displays a warning flash message.
 func (f *Flash) Warn(msg string) {
-	log.Warn().Msg(msg)
+	slog.Warn(msg)
 	f.SetMessage(FlashWarn, msg)
 }
 
@@ -94,7 +98,7 @@ func (f *Flash) Warnf(fmat string, args ...interface{}) {
 
 // Err displays an error flash message.
 func (f *Flash) Err(err error) {
-	log.Error().Msg(err.Error())
+	slog.Error("Flash failed", slogs.Error, err)
 	f.SetMessage(FlashErr, err.Error())
 }
 
@@ -107,7 +111,10 @@ func (f *Flash) Errf(fmat string, args ...interface{}) {
 			err = e
 		}
 	}
-	log.Error().Err(err).Msgf(fmat, args...)
+	slog.Error("Flashing error",
+		slogs.Error, err,
+		slogs.Message, fmt.Sprintf(fmat, args...),
+	)
 	f.SetMessage(FlashErr, fmt.Sprintf(fmat, args...))
 }
 

@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package xray
 
 import (
@@ -22,7 +25,7 @@ type Service struct{}
 func (s *Service) Render(ctx context.Context, ns string, o interface{}) error {
 	raw, ok := o.(*unstructured.Unstructured)
 	if !ok {
-		return fmt.Errorf("Expected Unstructured, but got %T", o)
+		return fmt.Errorf("expected Unstructured, but got %T", o)
 	}
 
 	var svc v1.Service
@@ -33,7 +36,7 @@ func (s *Service) Render(ctx context.Context, ns string, o interface{}) error {
 
 	parent, ok := ctx.Value(KeyParent).(*TreeNode)
 	if !ok {
-		return fmt.Errorf("Expecting a TreeNode but got %T", ctx.Value(KeyParent))
+		return fmt.Errorf("expecting a TreeNode but got %T", ctx.Value(KeyParent))
 	}
 
 	root := NewTreeNode("v1/services", client.FQN(svc.Namespace, svc.Name))
@@ -71,7 +74,7 @@ func (s *Service) Render(ctx context.Context, ns string, o interface{}) error {
 func (s *Service) locatePods(ctx context.Context, ns string, sel map[string]string) ([]runtime.Object, error) {
 	f, ok := ctx.Value(internal.KeyFactory).(dao.Factory)
 	if !ok {
-		return nil, fmt.Errorf("Expecting a factory but got %T", ctx.Value(internal.KeyFactory))
+		return nil, fmt.Errorf("expecting a factory but got %T", ctx.Value(internal.KeyFactory))
 	}
 
 	ll := make([]string, 0, len(sel))

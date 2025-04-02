@@ -1,14 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package view
 
 import (
+	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	"github.com/derailed/k9s/internal/config"
+	"github.com/derailed/k9s/internal/slogs"
 	"github.com/derailed/k9s/internal/ui"
 	"github.com/derailed/k9s/internal/ui/dialog"
 	"github.com/derailed/tcell/v2"
-	"github.com/rs/zerolog/log"
 )
 
 // AllScopes represents actions available for all views.
@@ -18,7 +23,7 @@ const AllScopes = "all"
 type Runner interface {
 	App() *App
 	GetSelectedItem() string
-	Aliases() []string
+	Aliases() map[string]struct{}
 	EnvFn() EnvFunc
 }
 
@@ -40,75 +45,128 @@ func includes(aliases []string, s string) bool {
 	return false
 }
 
-func inScope(scopes, aliases []string) bool {
+func inScope(scopes []string, aliases map[string]struct{}) bool {
 	if hasAll(scopes) {
 		return true
 	}
 	for _, s := range scopes {
-		if includes(aliases, s) {
-			return true
+		if _, ok := aliases[s]; ok {
+			return ok
 		}
 	}
 
 	return false
 }
 
-func hotKeyActions(r Runner, aa ui.KeyActions) {
+func hotKeyActions(r Runner, aa *ui.KeyActions) error {
 	hh := config.NewHotKeys()
-	if err := hh.Load(); err != nil {
-		return
-	}
+	aa.Range(func(k tcell.Key, a ui.KeyAction) {
+		if a.Opts.HotKey {
+			aa.Delete(k)
+		}
+	})
 
+	var errs error
+	if err := hh.Load(r.App().Config.ContextHotkeysPath()); err != nil {
+		errs = errors.Join(errs, err)
+	}
 	for k, hk := range hh.HotKey {
 		key, err := asKey(hk.ShortCut)
 		if err != nil {
-			log.Warn().Err(err).Msg("HOT-KEY Unable to map hotkey shortcut to a key")
+			errs = errors.Join(errs, err)
 			continue
 		}
-		_, ok := aa[key]
-		if ok {
-			log.Warn().Err(fmt.Errorf("HOT-KEY Doh! you are trying to override an existing command `%s", k)).Msg("Invalid shortcut")
+		if _, ok := aa.Get(key); ok {
+			if !hk.Override {
+				errs = errors.Join(errs, fmt.Errorf("duplicate hotkey found for %q in %q", hk.ShortCut, k))
+				continue
+			}
+			slog.Debug("HotKey overrode action shortcut",
+				slogs.Shortcut, hk.ShortCut,
+				slogs.Key, k,
+			)
+		}
+
+		command, err := r.EnvFn()().Substitute(hk.Command)
+		if err != nil {
+			slog.Warn("Invalid shortcut command", slogs.Error, err)
 			continue
 		}
-		aa[key] = ui.NewSharedKeyAction(
+
+		aa.Add(key, ui.NewKeyActionWithOpts(
 			hk.Description,
-			gotoCmd(r, hk.Command, ""),
-			false)
+			gotoCmd(r, command, "", !hk.KeepHistory),
+			ui.ActionOpts{
+				Shared: true,
+				HotKey: true,
+			},
+		))
 	}
+
+	return errs
 }
 
-func gotoCmd(r Runner, cmd, path string) ui.ActionHandler {
+func gotoCmd(r Runner, cmd, path string, clearStack bool) ui.ActionHandler {
 	return func(evt *tcell.EventKey) *tcell.EventKey {
-		r.App().gotoResource(cmd, path, true)
+		r.App().gotoResource(cmd, path, clearStack, true)
 		return nil
 	}
 }
 
-func pluginActions(r Runner, aa ui.KeyActions) {
+func pluginActions(r Runner, aa *ui.KeyActions) error {
+	aa.Range(func(k tcell.Key, a ui.KeyAction) {
+		if a.Opts.Plugin {
+			aa.Delete(k)
+		}
+	})
+
+	path, err := r.App().Config.ContextPluginsPath()
+	if err != nil {
+		return err
+	}
 	pp := config.NewPlugins()
-	if err := pp.Load(); err != nil {
-		return
+	if err := pp.Load(path, true); err != nil {
+		return err
 	}
 
-	for k, plugin := range pp.Plugin {
-		if !inScope(plugin.Scopes, r.Aliases()) {
+	var (
+		errs    error
+		aliases = r.Aliases()
+		ro      = r.App().Config.IsReadOnly()
+	)
+	for k, plugin := range pp.Plugins {
+		if !inScope(plugin.Scopes, aliases) || (ro && plugin.Dangerous) {
 			continue
 		}
+
 		key, err := asKey(plugin.ShortCut)
 		if err != nil {
-			log.Warn().Err(err).Msg("Unable to map plugin shortcut to a key")
+			errs = errors.Join(errs, err)
 			continue
 		}
-		_, ok := aa[key]
-		if ok {
-			log.Warn().Err(fmt.Errorf("Doh! you are trying to override an existing command `%s", k)).Msg("Invalid shortcut")
-			continue
+		if _, ok := aa.Get(key); ok {
+			if !plugin.Override {
+				errs = errors.Join(errs, fmt.Errorf("duplicate plugin key found for %q in %q", plugin.ShortCut, k))
+				continue
+			}
+			slog.Debug("Plugin overrode action shortcut",
+				slogs.Plugin, k,
+				slogs.Key, plugin.ShortCut,
+			)
 		}
-		aa[key] = ui.NewKeyAction(
+
+		aa.Add(key, ui.NewKeyActionWithOpts(
 			plugin.Description,
 			pluginAction(r, plugin),
-			true)
+			ui.ActionOpts{
+				Visible:   true,
+				Plugin:    true,
+				Dangerous: plugin.Dangerous,
+			},
+		))
 	}
+
+	return errs
 }
 
 func pluginAction(r Runner, p config.Plugin) ui.ActionHandler {
@@ -125,7 +183,7 @@ func pluginAction(r Runner, p config.Plugin) ui.ActionHandler {
 		for i, a := range p.Args {
 			arg, err := r.EnvFn()().Substitute(a)
 			if err != nil {
-				log.Error().Err(err).Msg("Plugin Args match failed")
+				slog.Error("Plugin Args match failed", slogs.Error, err)
 				return nil
 			}
 			args[i] = arg
@@ -133,17 +191,36 @@ func pluginAction(r Runner, p config.Plugin) ui.ActionHandler {
 
 		cb := func() {
 			opts := shellOpts{
-				clear:      true,
 				binary:     p.Command,
 				background: p.Background,
 				pipes:      p.Pipes,
 				args:       args,
 			}
-			if run(r.App(), opts) {
-				r.App().Flash().Info("Plugin command launched successfully!")
+			suspend, errChan, statusChan := run(r.App(), opts)
+			if !suspend {
+				r.App().Flash().Infof("Plugin command failed: %q", p.Description)
 				return
 			}
-			r.App().Flash().Info("Plugin command failed!")
+			var errs error
+			for e := range errChan {
+				errs = errors.Join(errs, e)
+			}
+			if errs != nil {
+				r.App().cowCmd(errs.Error())
+				return
+			}
+			go func() {
+				for st := range statusChan {
+					if !p.OverwriteOutput {
+						r.App().Flash().Infof("Plugin command launched successfully: %q", st)
+					} else if strings.Contains(st, outputPrefix) {
+						infoMsg := strings.TrimPrefix(st, outputPrefix)
+						r.App().Flash().Info(strings.TrimSpace(infoMsg))
+						return
+					}
+				}
+			}()
+
 		}
 		if p.Confirm {
 			msg := fmt.Sprintf("Run?\n%s %s", p.Command, strings.Join(args, " "))

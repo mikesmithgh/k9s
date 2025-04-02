@@ -1,23 +1,30 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package view
 
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/derailed/k9s/internal"
 	"github.com/derailed/k9s/internal/config"
 	"github.com/derailed/k9s/internal/model"
+	"github.com/derailed/k9s/internal/slogs"
 	"github.com/derailed/k9s/internal/ui"
+	"github.com/derailed/k9s/internal/view/cmd"
 	"github.com/derailed/tcell/v2"
 	"github.com/derailed/tview"
-	"github.com/rs/zerolog/log"
 	"github.com/sahilm/fuzzy"
 )
 
-const liveViewTitleFmt = "[fg:bg:b] %s([hilite:bg:b]%s[fg:bg:-])[fg:bg:-] "
+const (
+	liveViewTitleFmt = "[fg:bg:b] %s([hilite:bg:b]%s[fg:bg:-])[fg:bg:-] "
+	yamlAction       = "YAML"
+)
 
 // LiveView represents a live text viewer.
 type LiveView struct {
@@ -26,7 +33,7 @@ type LiveView struct {
 	title                     string
 	model                     model.ResourceViewer
 	text                      *tview.TextView
-	actions                   ui.KeyActions
+	actions                   *ui.KeyActions
 	app                       *App
 	cmdBuff                   *model.FishBuff
 	currentRegion, maxRegions int
@@ -43,16 +50,21 @@ func NewLiveView(app *App, title string, m model.ResourceViewer) *LiveView {
 		text:          tview.NewTextView(),
 		app:           app,
 		title:         title,
-		actions:       make(ui.KeyActions),
+		actions:       ui.NewKeyActions(),
 		currentRegion: 0,
 		maxRegions:    0,
 		cmdBuff:       model.NewFishBuff('/', model.FilterBuffer),
 		model:         m,
+		autoRefresh:   app.Config.K9s.LiveViewAutoRefresh,
 	}
 	v.AddItem(v.text, 0, 1, true)
 
 	return &v
 }
+
+func (v *LiveView) SetCommand(*cmd.Interpreter)      {}
+func (v *LiveView) SetFilter(string)                 {}
+func (v *LiveView) SetLabelFilter(map[string]string) {}
 
 // Init initializes the viewer.
 func (v *LiveView) Init(_ context.Context) error {
@@ -69,13 +81,16 @@ func (v *LiveView) Init(_ context.Context) error {
 
 	v.app.Styles.AddListener(v)
 	v.StylesChanged(v.app.Styles)
+	v.setFullScreen(v.app.Config.K9s.UI.DefaultsToFullScreen)
 
 	v.app.Prompt().SetModel(v.cmdBuff)
 	v.cmdBuff.AddListener(v)
 
 	v.bindKeys()
 	v.SetInputCapture(v.keyboard)
-	v.model.AddListener(v)
+	if v.model != nil {
+		v.model.AddListener(v)
+	}
 
 	return nil
 }
@@ -85,44 +100,24 @@ func (v *LiveView) InCmdMode() bool {
 	return v.cmdBuff.InCmdMode()
 }
 
-// ResourceFailed notifies when their is an issue.
+// ResourceFailed notifies when there is an issue.
 func (v *LiveView) ResourceFailed(err error) {
 	v.text.SetTextAlign(tview.AlignCenter)
 	x, _, w, _ := v.GetRect()
 	v.text.SetText(cowTalk(err.Error(), x+w))
 }
 
-func (*LiveView) linesWithRegions(lines []string, matches fuzzy.Matches) []string {
-	ll := make([]string, len(lines))
-	copy(ll, lines)
-	offsetForLine := make(map[int]int)
-	for i, m := range matches {
-		loc, line := m.MatchedIndexes, ll[m.Index]
-		offset := offsetForLine[m.Index]
-		loc[0], loc[1] = loc[0]+offset, loc[1]+offset
-		regionStr := `<<<"search_` + strconv.Itoa(i) + `">>>` + line[loc[0]:loc[1]] + `<<<"">>>`
-		ll[m.Index] = line[:loc[0]] + regionStr + line[loc[1]:]
-		offsetForLine[m.Index] += len(regionStr) - (loc[1] - loc[0])
-	}
-	return ll
-}
-
 // ResourceChanged notifies when the filter changes.
 func (v *LiveView) ResourceChanged(lines []string, matches fuzzy.Matches) {
 	v.app.QueueUpdateDraw(func() {
-		defer func(t time.Time) {
-			log.Debug().Msgf("Live view render time: %v", time.Since(t))
-		}(time.Now())
-
 		v.text.SetTextAlign(tview.AlignLeft)
-		v.maxRegions = len(matches)
+		v.currentRegion, v.maxRegions = 0, len(matches)
 
 		if v.text.GetText(true) == "" {
 			v.text.ScrollToBeginning()
 		}
 
-		lines = v.linesWithRegions(lines, matches)
-
+		lines = linesWithRegions(lines, matches)
 		v.text.SetText(colorizeYAML(v.app.Styles.Views().Yaml, strings.Join(lines, "\n")))
 		v.text.Highlight()
 		if v.currentRegion < v.maxRegions {
@@ -147,7 +142,7 @@ func (v *LiveView) BufferActive(state bool, k model.BufferKind) {
 }
 
 func (v *LiveView) bindKeys() {
-	v.actions.Set(ui.KeyActions{
+	v.actions.Bulk(ui.KeyMap{
 		tcell.KeyEnter:  ui.NewSharedKeyAction("Filter", v.filterCmd, false),
 		tcell.KeyEscape: ui.NewKeyAction("Back", v.resetCmd, false),
 		tcell.KeyCtrlS:  ui.NewKeyAction("Save", v.saveCmd, false),
@@ -160,11 +155,41 @@ func (v *LiveView) bindKeys() {
 		tcell.KeyDelete: ui.NewSharedKeyAction("Erase", v.eraseCmd, false),
 	})
 
-	if v.title == "YAML" {
-		v.actions.Add(ui.KeyActions{
-			ui.KeyM: ui.NewKeyAction("Toggle ManagedFields", v.toggleManagedCmd, true),
-		})
+	if !v.app.Config.IsReadOnly() {
+		v.actions.Add(ui.KeyE, ui.NewKeyAction("Edit", v.editCmd, true))
 	}
+	if v.title == yamlAction {
+		v.actions.Add(ui.KeyM, ui.NewKeyAction("Toggle ManagedFields", v.toggleManagedCmd, true))
+	}
+	if v.model != nil && v.model.GVR().IsDecodable() {
+		v.actions.Add(ui.KeyX, ui.NewKeyAction("Toggle Decode", v.toggleEncodedDecodedCmd, true))
+	}
+}
+
+func (v *LiveView) toggleEncodedDecodedCmd(evt *tcell.EventKey) *tcell.EventKey {
+	m, ok := v.model.(model.EncDecResourceViewer)
+
+	if !ok {
+		return evt
+	}
+
+	m.Toggle()
+	v.Start()
+	return nil
+}
+
+func (v *LiveView) editCmd(evt *tcell.EventKey) *tcell.EventKey {
+	path := v.model.GetPath()
+	if path == "" {
+		return evt
+	}
+	v.Stop()
+	defer v.Start()
+	if err := editRes(v.app, v.model.GVR(), path); err != nil {
+		v.app.Flash().Err(err)
+	}
+
+	return nil
 }
 
 // ToggleRefreshCmd is used for pausing the refreshing of data on config map and secrets.
@@ -182,7 +207,7 @@ func (v *LiveView) toggleRefreshCmd(evt *tcell.EventKey) *tcell.EventKey {
 }
 
 func (v *LiveView) keyboard(evt *tcell.EventKey) *tcell.EventKey {
-	if a, ok := v.actions[ui.AsKey(evt)]; ok {
+	if a, ok := v.actions.Get(ui.AsKey(evt)); ok {
 		return a.Action(evt)
 	}
 
@@ -194,11 +219,10 @@ func (v *LiveView) StylesChanged(s *config.Styles) {
 	v.SetBackgroundColor(v.app.Styles.BgColor())
 	v.text.SetTextColor(v.app.Styles.FgColor())
 	v.SetBorderFocusColor(v.app.Styles.Frame().Border.FocusColor.Color())
-	v.ResourceChanged(v.model.Peek(), nil)
 }
 
 // Actions returns menu actions.
-func (v *LiveView) Actions() ui.KeyActions {
+func (v *LiveView) Actions() *ui.KeyActions {
 	return v.actions
 }
 
@@ -212,12 +236,12 @@ func (v *LiveView) Start() {
 		ctx, v.cancel = context.WithCancel(v.defaultCtx())
 
 		if err := v.model.Watch(ctx); err != nil {
-			log.Error().Err(err).Msgf("LiveView watcher failed")
+			slog.Error("LiveView watcher failed", slogs.Error, err)
 		}
 		return
 	}
 	if err := v.model.Refresh(v.defaultCtx()); err != nil {
-		log.Error().Err(err).Msgf("refresh failed")
+		slog.Error("LiveView refresh failed", slogs.Error, err)
 	}
 }
 
@@ -260,16 +284,20 @@ func (v *LiveView) toggleFullScreenCmd(evt *tcell.EventKey) *tcell.EventKey {
 		return evt
 	}
 
-	v.fullScreen = !v.fullScreen
-	v.SetFullScreen(v.fullScreen)
-	v.Box.SetBorder(!v.fullScreen)
-	if v.fullScreen {
-		v.Box.SetBorderPadding(0, 0, 0, 0)
-	} else {
-		v.Box.SetBorderPadding(0, 0, 1, 1)
-	}
+	v.setFullScreen(!v.fullScreen)
 
 	return nil
+}
+
+func (v *LiveView) setFullScreen(isFullScreen bool) {
+	v.fullScreen = isFullScreen
+	v.SetFullScreen(isFullScreen)
+	v.SetBorder(!isFullScreen)
+	if isFullScreen {
+		v.SetBorderPadding(0, 0, 0, 0)
+	} else {
+		v.SetBorderPadding(0, 0, 1, 1)
+	}
 }
 
 func (v *LiveView) nextCmd(evt *tcell.EventKey) *tcell.EventKey {
@@ -347,10 +375,11 @@ func (v *LiveView) resetCmd(evt *tcell.EventKey) *tcell.EventKey {
 }
 
 func (v *LiveView) saveCmd(evt *tcell.EventKey) *tcell.EventKey {
-	if path, err := saveYAML(v.app.Config.K9s.GetScreenDumpDir(), v.app.Config.K9s.CurrentContextDir(), v.title, v.text.GetText(true)); err != nil {
+	name := fmt.Sprintf("%s--%s", strings.Replace(v.model.GetPath(), "/", "-", 1), strings.ToLower(v.title))
+	if _, err := saveYAML(v.app.Config.K9s.ContextScreenDumpDir(), name, sanitizeEsc(v.text.GetText(true))); err != nil {
 		v.app.Flash().Err(err)
 	} else {
-		v.app.Flash().Infof("Log %s saved successfully!", path)
+		v.app.Flash().Infof("File %q saved successfully!", name)
 	}
 
 	return nil
@@ -360,7 +389,10 @@ func (v *LiveView) updateTitle() {
 	if v.title == "" {
 		return
 	}
-	fmat := fmt.Sprintf(liveViewTitleFmt, v.title, v.model.GetPath())
+	var fmat string
+	if v.model != nil {
+		fmat = fmt.Sprintf(liveViewTitleFmt, v.title, v.model.GetPath())
+	}
 
 	buff := v.cmdBuff.GetText()
 	if buff == "" {

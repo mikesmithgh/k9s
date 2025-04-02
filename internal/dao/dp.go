@@ -1,12 +1,17 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package dao
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/derailed/k9s/internal/client"
-	"github.com/rs/zerolog/log"
+	"github.com/derailed/k9s/internal/render"
+	"github.com/derailed/k9s/internal/slogs"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,6 +32,7 @@ var (
 	_ Scalable        = (*Deployment)(nil)
 	_ Controller      = (*Deployment)(nil)
 	_ ContainsPodSpec = (*Deployment)(nil)
+	_ ImageLister     = (*Deployment)(nil)
 )
 
 // Deployment represents a deployment K8s resource.
@@ -34,15 +40,20 @@ type Deployment struct {
 	Resource
 }
 
-// IsHappy check for happy deployments.
-func (d *Deployment) IsHappy(dp appsv1.Deployment) bool {
-	return dp.Status.Replicas == dp.Status.AvailableReplicas
+// ListImages lists container images.
+func (d *Deployment) ListImages(ctx context.Context, fqn string) ([]string, error) {
+	dp, err := d.GetInstance(fqn)
+	if err != nil {
+		return nil, err
+	}
+
+	return render.ExtractImages(&dp.Spec.Template.Spec), nil
 }
 
 // Scale a Deployment.
 func (d *Deployment) Scale(ctx context.Context, path string, replicas int32) error {
 	ns, n := client.Namespaced(path)
-	auth, err := d.Client().CanI(ns, "apps/v1/deployments:scale", []string{client.GetVerb, client.UpdateVerb})
+	auth, err := d.Client().CanI(ns, "apps/v1/deployments:scale", n, []string{client.GetVerb, client.UpdateVerb})
 	if err != nil {
 		return err
 	}
@@ -66,7 +77,7 @@ func (d *Deployment) Scale(ctx context.Context, path string, replicas int32) err
 
 // Restart a Deployment rollout.
 func (d *Deployment) Restart(ctx context.Context, path string) error {
-	o, err := d.GetFactory().Get("apps/v1/deployments", path, true, labels.Everything())
+	o, err := d.getFactory().Get("apps/v1/deployments", path, true, labels.Everything())
 	if err != nil {
 		return err
 	}
@@ -76,7 +87,7 @@ func (d *Deployment) Restart(ctx context.Context, path string) error {
 		return err
 	}
 
-	auth, err := d.Client().CanI(dp.Namespace, "apps/v1/deployments", []string{client.PatchVerb})
+	auth, err := d.Client().CanI(dp.Namespace, "apps/v1/deployments", dp.Name, client.PatchAccess)
 	if err != nil {
 		return err
 	}
@@ -115,12 +126,12 @@ func (d *Deployment) Restart(ctx context.Context, path string) error {
 
 // TailLogs tail logs for all pods represented by this Deployment.
 func (d *Deployment) TailLogs(ctx context.Context, opts *LogOptions) ([]LogChan, error) {
-	dp, err := d.Load(d.Factory, opts.Path)
+	dp, err := d.GetInstance(opts.Path)
 	if err != nil {
 		return nil, err
 	}
 	if dp.Spec.Selector == nil || len(dp.Spec.Selector.MatchLabels) == 0 {
-		return nil, fmt.Errorf("No valid selector found on Deployment %s", opts.Path)
+		return nil, fmt.Errorf("no valid selector found on deployment: %s", opts.Path)
 	}
 
 	return podLogs(ctx, dp.Spec.Selector.MatchLabels, opts)
@@ -128,7 +139,7 @@ func (d *Deployment) TailLogs(ctx context.Context, opts *LogOptions) ([]LogChan,
 
 // Pod returns a pod victim by name.
 func (d *Deployment) Pod(fqn string) (string, error) {
-	dp, err := d.Load(d.Factory, fqn)
+	dp, err := d.GetInstance(fqn)
 	if err != nil {
 		return "", err
 	}
@@ -136,9 +147,9 @@ func (d *Deployment) Pod(fqn string) (string, error) {
 	return podFromSelector(d.Factory, dp.Namespace, dp.Spec.Selector.MatchLabels)
 }
 
-// Load returns a deployment instance.
-func (*Deployment) Load(f Factory, fqn string) (*appsv1.Deployment, error) {
-	o, err := f.Get("apps/v1/deployments", fqn, true, labels.Everything())
+// GetInstance fetch a matching deployment.
+func (d *Deployment) GetInstance(fqn string) (*appsv1.Deployment, error) {
+	o, err := d.Factory.Get(d.GVR(), fqn, true, labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +166,7 @@ func (*Deployment) Load(f Factory, fqn string) (*appsv1.Deployment, error) {
 // ScanSA scans for serviceaccount refs.
 func (d *Deployment) ScanSA(ctx context.Context, fqn string, wait bool) (Refs, error) {
 	ns, n := client.Namespaced(fqn)
-	oo, err := d.GetFactory().List(d.GVR(), ns, wait, labels.Everything())
+	oo, err := d.getFactory().List(d.GVR(), ns, wait, labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -179,9 +190,9 @@ func (d *Deployment) ScanSA(ctx context.Context, fqn string, wait bool) (Refs, e
 }
 
 // Scan scans for resource references.
-func (d *Deployment) Scan(ctx context.Context, gvr, fqn string, wait bool) (Refs, error) {
+func (d *Deployment) Scan(ctx context.Context, gvr client.GVR, fqn string, wait bool) (Refs, error) {
 	ns, n := client.Namespaced(fqn)
-	oo, err := d.GetFactory().List(d.GVR(), ns, wait, labels.Everything())
+	oo, err := d.getFactory().List(d.GVR(), ns, wait, labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -194,7 +205,7 @@ func (d *Deployment) Scan(ctx context.Context, gvr, fqn string, wait bool) (Refs
 			return nil, errors.New("expecting Deployment resource")
 		}
 		switch gvr {
-		case "v1/configmaps":
+		case CmGVR:
 			if !hasConfigMap(&dp.Spec.Template.Spec, n) {
 				continue
 			}
@@ -202,10 +213,13 @@ func (d *Deployment) Scan(ctx context.Context, gvr, fqn string, wait bool) (Refs
 				GVR: d.GVR(),
 				FQN: client.FQN(dp.Namespace, dp.Name),
 			})
-		case "v1/secrets":
+		case SecGVR:
 			found, err := hasSecret(d.Factory, &dp.Spec.Template.Spec, dp.Namespace, n, wait)
 			if err != nil {
-				log.Warn().Err(err).Msgf("scanning secret %q", fqn)
+				slog.Warn("Fail to locate secret",
+					slogs.FQN, fqn,
+					slogs.Error, err,
+				)
 				continue
 			}
 			if !found {
@@ -215,7 +229,7 @@ func (d *Deployment) Scan(ctx context.Context, gvr, fqn string, wait bool) (Refs
 				GVR: d.GVR(),
 				FQN: client.FQN(dp.Namespace, dp.Name),
 			})
-		case "v1/persistentvolumeclaims":
+		case PvcGVR:
 			if !hasPVC(&dp.Spec.Template.Spec, n) {
 				continue
 			}
@@ -223,7 +237,7 @@ func (d *Deployment) Scan(ctx context.Context, gvr, fqn string, wait bool) (Refs
 				GVR: d.GVR(),
 				FQN: client.FQN(dp.Namespace, dp.Name),
 			})
-		case "scheduling.k8s.io/v1/priorityclasses":
+		case PcGVR:
 			if !hasPC(&dp.Spec.Template.Spec, n) {
 				continue
 			}
@@ -240,7 +254,7 @@ func (d *Deployment) Scan(ctx context.Context, gvr, fqn string, wait bool) (Refs
 
 // GetPodSpec returns a pod spec given a resource.
 func (d *Deployment) GetPodSpec(path string) (*v1.PodSpec, error) {
-	dp, err := d.Load(d.Factory, path)
+	dp, err := d.GetInstance(path)
 	if err != nil {
 		return nil, err
 	}
@@ -251,7 +265,7 @@ func (d *Deployment) GetPodSpec(path string) (*v1.PodSpec, error) {
 // SetImages sets container images.
 func (d *Deployment) SetImages(ctx context.Context, path string, imageSpecs ImageSpecs) error {
 	ns, n := client.Namespaced(path)
-	auth, err := d.Client().CanI(ns, "apps/v1/deployments", []string{client.PatchVerb})
+	auth, err := d.Client().CanI(ns, "apps/v1/deployments", n, client.PatchAccess)
 	if err != nil {
 		return err
 	}
@@ -291,19 +305,24 @@ func hasPC(spec *v1.PodSpec, name string) bool {
 
 func hasConfigMap(spec *v1.PodSpec, name string) bool {
 	for _, c := range spec.InitContainers {
-		if containerHasConfigMap(c, name) {
+		if containerHasConfigMap(c.EnvFrom, c.Env, name) {
 			return true
 		}
 	}
 	for _, c := range spec.Containers {
-		if containerHasConfigMap(c, name) {
+		if containerHasConfigMap(c.EnvFrom, c.Env, name) {
+			return true
+		}
+	}
+	for _, c := range spec.EphemeralContainers {
+		if containerHasConfigMap(c.EnvFrom, c.Env, name) {
 			return true
 		}
 	}
 
 	for _, v := range spec.Volumes {
-		if cm := v.VolumeSource.ConfigMap; cm != nil {
-			if cm.LocalObjectReference.Name == name {
+		if cm := v.ConfigMap; cm != nil {
+			if cm.Name == name {
 				return true
 			}
 		}
@@ -311,21 +330,32 @@ func hasConfigMap(spec *v1.PodSpec, name string) bool {
 	return false
 }
 
-// BOZO !! Need to deal with ephemeral containers.
 func hasSecret(f Factory, spec *v1.PodSpec, ns, name string, wait bool) (bool, error) {
 	for _, c := range spec.InitContainers {
-		if containerHasSecret(c, name) {
-			return true, nil
-		}
-	}
-	for _, c := range spec.Containers {
-		if containerHasSecret(c, name) {
+		if containerHasSecret(c.EnvFrom, c.Env, name) {
 			return true, nil
 		}
 	}
 
-	saName := spec.ServiceAccountName
-	if saName != "" {
+	for _, c := range spec.Containers {
+		if containerHasSecret(c.EnvFrom, c.Env, name) {
+			return true, nil
+		}
+	}
+
+	for _, c := range spec.EphemeralContainers {
+		if containerHasSecret(c.EnvFrom, c.Env, name) {
+			return true, nil
+		}
+	}
+
+	for _, s := range spec.ImagePullSecrets {
+		if s.Name == name {
+			return true, nil
+		}
+	}
+
+	if saName := spec.ServiceAccountName; saName != "" {
 		o, err := f.Get("v1/serviceaccounts", client.FQN(ns, saName), wait, labels.Everything())
 		if err != nil {
 			return false, err
@@ -345,7 +375,7 @@ func hasSecret(f Factory, spec *v1.PodSpec, ns, name string, wait bool) (bool, e
 	}
 
 	for _, v := range spec.Volumes {
-		if sec := v.VolumeSource.Secret; sec != nil {
+		if sec := v.Secret; sec != nil {
 			if sec.SecretName == name {
 				return true, nil
 			}
@@ -354,13 +384,13 @@ func hasSecret(f Factory, spec *v1.PodSpec, ns, name string, wait bool) (bool, e
 	return false, nil
 }
 
-func containerHasSecret(c v1.Container, name string) bool {
-	for _, e := range c.EnvFrom {
+func containerHasSecret(envFrom []v1.EnvFromSource, env []v1.EnvVar, name string) bool {
+	for _, e := range envFrom {
 		if e.SecretRef != nil && e.SecretRef.Name == name {
 			return true
 		}
 	}
-	for _, e := range c.Env {
+	for _, e := range env {
 		if e.ValueFrom == nil || e.ValueFrom.SecretKeyRef == nil {
 			continue
 		}
@@ -372,13 +402,13 @@ func containerHasSecret(c v1.Container, name string) bool {
 	return false
 }
 
-func containerHasConfigMap(c v1.Container, name string) bool {
-	for _, e := range c.EnvFrom {
+func containerHasConfigMap(envFrom []v1.EnvFromSource, env []v1.EnvVar, name string) bool {
+	for _, e := range envFrom {
 		if e.ConfigMapRef != nil && e.ConfigMapRef.Name == name {
 			return true
 		}
 	}
-	for _, e := range c.Env {
+	for _, e := range env {
 		if e.ValueFrom == nil || e.ValueFrom.ConfigMapKeyRef == nil {
 			continue
 		}

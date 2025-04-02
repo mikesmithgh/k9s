@@ -1,14 +1,19 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package dao
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 
 	"github.com/derailed/k9s/internal"
 	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/render"
-	"github.com/rs/zerolog/log"
+	"github.com/derailed/k9s/internal/slogs"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
@@ -33,16 +38,23 @@ type Node struct {
 }
 
 // ToggleCordon toggles cordon/uncordon a node.
-func (n *Node) ToggleCordon(path string, cordon bool) error {
-	log.Debug().Msgf("CORDON %q::%t -- %q", path, cordon, n.gvr.GVK())
-	o, err := FetchNode(context.Background(), n.Factory, path)
+func (n *Node) ToggleCordon(fqn string, cordon bool) error {
+	slog.Debug("Toggle cordon on node",
+		slogs.GVR, n.GVR(),
+		slogs.FQN, fqn,
+		slogs.Bool, cordon,
+	)
+	o, err := FetchNode(context.Background(), n.Factory, fqn)
 	if err != nil {
 		return err
 	}
 
 	h, err := drain.NewCordonHelperFromRuntimeObject(o, scheme.Scheme, n.gvr.GVK())
 	if err != nil {
-		log.Debug().Msgf("BOOM %v", err)
+		slog.Debug("Fail to toggle cordon on node",
+			slogs.FQN, fqn,
+			slogs.Error, err,
+		)
 		return err
 	}
 
@@ -52,7 +64,7 @@ func (n *Node) ToggleCordon(path string, cordon bool) error {
 		}
 		return fmt.Errorf("node is already uncordoned")
 	}
-	dial, err := n.GetFactory().Client().Dial()
+	dial, err := n.getFactory().Client().Dial()
 	if err != nil {
 		return err
 	}
@@ -75,6 +87,7 @@ func (o DrainOptions) toDrainHelper(k kubernetes.Interface, w io.Writer) drain.H
 		Timeout:             o.Timeout,
 		DeleteEmptyDirData:  o.DeleteEmptyDirData,
 		IgnoreAllDaemonSets: o.IgnoreAllDaemonSets,
+		DisableEviction:     o.DisableEviction,
 		Out:                 w,
 		ErrOut:              w,
 		Force:               o.Force,
@@ -83,9 +96,18 @@ func (o DrainOptions) toDrainHelper(k kubernetes.Interface, w io.Writer) drain.H
 
 // Drain drains a node.
 func (n *Node) Drain(path string, opts DrainOptions, w io.Writer) error {
-	_ = n.ToggleCordon(path, true)
+	cordoned, err := n.ensureCordoned(path)
+	if err != nil {
+		return err
+	}
 
-	dial, err := n.GetFactory().Client().Dial()
+	if !cordoned {
+		if err = n.ToggleCordon(path, true); err != nil {
+			return err
+		}
+	}
+
+	dial, err := n.getFactory().Client().Dial()
 	if err != nil {
 		return err
 	}
@@ -93,17 +115,17 @@ func (n *Node) Drain(path string, opts DrainOptions, w io.Writer) error {
 	dd, errs := h.GetPodsForDeletion(path)
 	if len(errs) != 0 {
 		for _, e := range errs {
-			if _, err := h.ErrOut.Write([]byte(e.Error() + "\n")); err != nil {
+			if _, err := fmt.Fprintf(h.ErrOut, "[%s] %s\n", path, e.Error()); err != nil {
 				return err
 			}
 		}
-		return errs[0]
+		return errors.Join(errs...)
 	}
 
 	if err := h.DeleteOrEvictPods(dd.Pods()); err != nil {
 		return err
 	}
-	fmt.Fprintf(h.Out, "Node %s drained!", path)
+	_, _ = fmt.Fprintf(h.Out, "Node %s drained!", path)
 
 	return nil
 }
@@ -126,7 +148,7 @@ func (n *Node) Get(ctx context.Context, path string) (runtime.Object, error) {
 	}
 
 	var nmx *mv1beta1.NodeMetrics
-	if withMx, ok := ctx.Value(internal.KeyWithMetrics).(bool); withMx || !ok {
+	if withMx, ok := ctx.Value(internal.KeyWithMetrics).(bool); ok && withMx {
 		nmx, _ = client.DialMetrics(n.Client()).FetchNodeMetrics(ctx, path)
 	}
 
@@ -145,6 +167,8 @@ func (n *Node) List(ctx context.Context, ns string) ([]runtime.Object, error) {
 		nmx, _ = client.DialMetrics(n.Client()).FetchNodesMetricsMap(ctx)
 	}
 
+	shouldCountPods, _ := ctx.Value(internal.KeyPodCounting).(bool)
+
 	res := make([]runtime.Object, 0, len(oo))
 	for _, o := range oo {
 		u, ok := o.(*unstructured.Unstructured)
@@ -154,9 +178,15 @@ func (n *Node) List(ctx context.Context, ns string) ([]runtime.Object, error) {
 
 		fqn := extractFQN(o)
 		_, name := client.Namespaced(fqn)
-		podCount, err := n.CountPods(name)
-		if err != nil {
-			log.Error().Err(err).Msgf("unable to get pods count for %s", name)
+		podCount := -1
+		if shouldCountPods {
+			podCount, err = n.CountPods(name)
+			if err != nil {
+				slog.Error("Unable to get pods count",
+					slogs.ResName, name,
+					slogs.Error, err,
+				)
+			}
 		}
 		res = append(res, &render.NodeWithMetrics{
 			Raw:      u,
@@ -171,7 +201,7 @@ func (n *Node) List(ctx context.Context, ns string) ([]runtime.Object, error) {
 // CountPods counts the pods scheduled on a given node.
 func (n *Node) CountPods(nodeName string) (int, error) {
 	var count int
-	oo, err := n.GetFactory().List("v1/pods", client.AllNamespaces, false, labels.Everything())
+	oo, err := n.getFactory().List("v1/pods", client.BlankNamespace, false, labels.Everything())
 	if err != nil {
 		return 0, err
 	}
@@ -195,7 +225,7 @@ func (n *Node) CountPods(nodeName string) (int, error) {
 
 // GetPods returns all pods running on given node.
 func (n *Node) GetPods(nodeName string) ([]*v1.Pod, error) {
-	oo, err := n.GetFactory().List("v1/pods", client.AllNamespaces, false, labels.Everything())
+	oo, err := n.getFactory().List("v1/pods", client.BlankNamespace, false, labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -214,12 +244,23 @@ func (n *Node) GetPods(nodeName string) ([]*v1.Pod, error) {
 	return pp, nil
 }
 
+// ensureCordoned returns whether the given node has been cordoned
+func (n *Node) ensureCordoned(path string) (bool, error) {
+	o, err := FetchNode(context.Background(), n.Factory, path)
+	if err != nil {
+		return false, err
+	}
+
+	return o.Spec.Unschedulable, nil
+}
+
 // ----------------------------------------------------------------------------
 // Helpers...
 
 // FetchNode retrieves a node.
 func FetchNode(ctx context.Context, f Factory, path string) (*v1.Node, error) {
-	auth, err := f.Client().CanI(client.ClusterScope, "v1/nodes", []string{"get"})
+	_, n := client.Namespaced(path)
+	auth, err := f.Client().CanI(client.ClusterScope, "v1/nodes", n, client.GetAccess)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +268,7 @@ func FetchNode(ctx context.Context, f Factory, path string) (*v1.Node, error) {
 		return nil, fmt.Errorf("user is not authorized to list nodes")
 	}
 
-	o, err := f.Get("v1/nodes", client.FQN(client.ClusterScope, path), false, labels.Everything())
+	o, err := f.Get("v1/nodes", client.FQN(client.ClusterScope, path), true, labels.Everything())
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +284,7 @@ func FetchNode(ctx context.Context, f Factory, path string) (*v1.Node, error) {
 
 // FetchNodes retrieves all nodes.
 func FetchNodes(ctx context.Context, f Factory, labelsSel string) (*v1.NodeList, error) {
-	auth, err := f.Client().CanI(client.ClusterScope, "v1/nodes", []string{client.ListVerb})
+	auth, err := f.Client().CanI(client.ClusterScope, "v1/nodes", "", client.ListAccess)
 	if err != nil {
 		return nil, err
 	}

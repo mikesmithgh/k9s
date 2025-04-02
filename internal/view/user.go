@@ -1,13 +1,15 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright Authors of K9s
+
 package view
 
 import (
 	"context"
 
-	"github.com/derailed/tcell/v2"
-
 	"github.com/derailed/k9s/internal"
 	"github.com/derailed/k9s/internal/client"
 	"github.com/derailed/k9s/internal/ui"
+	"github.com/derailed/tcell/v2"
 )
 
 // User presents a user viewer.
@@ -24,9 +26,9 @@ func NewUser(gvr client.GVR) ResourceViewer {
 	return &u
 }
 
-func (u *User) bindKeys(aa ui.KeyActions) {
+func (u *User) bindKeys(aa *ui.KeyActions) {
 	aa.Delete(ui.KeyShiftA, ui.KeyShiftP, tcell.KeyCtrlSpace, ui.KeySpace, tcell.KeyCtrlD, ui.KeyE)
-	aa.Add(ui.KeyActions{
+	aa.Bulk(ui.KeyMap{
 		tcell.KeyEnter: ui.NewKeyAction("Rules", u.policyCmd, true),
 		ui.KeyShiftK:   ui.NewKeyAction("Sort Kind", u.GetTable().SortColCmd("KIND", true), false),
 	})
